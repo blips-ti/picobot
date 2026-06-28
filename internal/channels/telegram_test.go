@@ -178,3 +178,87 @@ func TestStartTelegramWithBase(t *testing.T) {
 	// give a small grace period
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestTelegramCallbackQuery(t *testing.T) {
+	token := "testtoken"
+	answered := make(chan string, 1)
+	edited := make(chan string, 1)
+
+	first := true
+	h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(path, "/getUpdates") {
+			if first {
+				first = false
+				w.Write([]byte(`{
+					"ok": true,
+					"result": [{
+						"update_id": 100,
+						"callback_query": {
+							"id": "query123",
+							"from": {"id": 1269963921},
+							"message": {
+								"message_id": 987,
+								"chat": {"id": 456}
+							},
+							"data": "yes"
+						}
+					}]
+				}`))
+				return
+			}
+			w.Write([]byte(`{"ok":true,"result":[]}`))
+			return
+		}
+		if strings.HasSuffix(path, "/answerCallbackQuery") {
+			r.ParseForm()
+			answered <- r.FormValue("callback_query_id")
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		if strings.HasSuffix(path, "/editMessageReplyMarkup") {
+			r.ParseForm()
+			edited <- r.FormValue("message_id")
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
+	}))
+	defer h.Close()
+
+	b := chat.NewHub(2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := StartTelegramWithBase(ctx, b, token, h.URL, []string{"1269963921"})
+	if err != nil {
+		t.Fatalf("failed to start Telegram: %v", err)
+	}
+
+	select {
+	case msg := <-b.In:
+		if msg.Content != "yes" || msg.ChatID != "456" || msg.SenderID != "1269963921" {
+			t.Fatalf("unexpected inbound message: %+v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for callback query to route to Inbound")
+	}
+
+	select {
+	case id := <-answered:
+		if id != "query123" {
+			t.Fatalf("unexpected callback query ID answered: %s", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for callback query to be answered")
+	}
+
+	select {
+	case id := <-edited:
+		if id != "987" {
+			t.Fatalf("unexpected message ID edited: %s", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for message reply markup to be edited")
+	}
+}

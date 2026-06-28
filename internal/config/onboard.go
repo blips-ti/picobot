@@ -203,10 +203,12 @@ Examples:
 ## Shell Execution
 
 ### exec
-Execute a shell command and return output.
-- command: the shell command to run
-- Commands have a timeout (default 60s)
-- Dangerous commands are blocked
+Execute shell commands or raw shell strings in the workspace.
+Parameters:
+- cmd: array of strings representing the program and arguments (e.g. ["python3", "delete_projects.py"]). Safe commands run directly.
+- shell_cmd: raw shell command string executed via /bin/sh -c (e.g. "pip3 install pdfkit && python3 run.py"). Useful for pipe, redirection, or chaining.
+- ALL command executions in interactive chats require explicit user approval (via inline buttons) before they run.
+- Do NOT try to empty/truncate files (writing empty strings to files) as a workaround to delete them. If you need to delete files or folders, use shell_cmd to run rm/rmdir (which will prompt the user for approval).
 
 ## Web Access
 

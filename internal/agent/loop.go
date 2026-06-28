@@ -97,7 +97,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 	reg.Register(fsTool)
 	reg.Register(tools.NewSendFileTool(b, workspace))
 
-	reg.Register(tools.NewExecToolWithWorkspace(60, workspace))
+	reg.Register(tools.NewExecToolWithWorkspace(b, 60, workspace))
 	reg.Register(tools.NewWebTool())
 	reg.Register(tools.NewWebSearchTool())
 	reg.Register(tools.NewSpawnTool())
@@ -182,141 +182,156 @@ func (a *AgentLoop) Run(ctx context.Context) {
 
 			log.Printf("Processing message from %s:%s\n", msg.Channel, msg.SenderID)
 
-			// Quick heuristic: if user asks the agent to remember something explicitly,
-			// store it in today's note and reply immediately without calling the LLM.
-			trimmed := strings.TrimSpace(msg.Content)
-			rememberRe := rememberRE
-			if matches := rememberRe.FindStringSubmatch(trimmed); len(matches) == 2 {
-				note := matches[1]
-				if err := a.memory.AppendToday(note); err != nil {
-					log.Printf("error appending to memory: %v", err)
-				}
-				out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: "OK, I've remembered that."}
-				select {
-				case a.hub.Out <- out:
-				default:
-					log.Println("Outbound channel full, dropping message")
-				}
-				// Only save session for interactive channels, not system triggers.
-				if !isSystemChannel(msg.Channel) {
-					sess := a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
-					sess.AddMessage("user", msg.Content)
-					sess.AddMessage("assistant", "OK, I've remembered that.")
-					if err := a.sessions.Save(sess); err != nil {
-						log.Printf("error saving session: %v", err)
-					}
-				}
+			// Check if this message resolves a pending tool execution approval (e.g. exec)
+			key := msg.Channel + ":" + msg.ChatID
+			if chat.TriggerApproval(key, msg.Content) {
 				continue
 			}
 
-			// Set tool context (so message tool knows channel+chat)
-			if mt := a.tools.Get("message"); mt != nil {
-				if mtool, ok := mt.(interface{ SetContext(string, string) }); ok {
-					mtool.SetContext(msg.Channel, msg.ChatID)
-				}
-			}
-			if sft := a.tools.Get("send_file"); sft != nil {
-				if sftool, ok := sft.(interface{ SetContext(string, string) }); ok {
-					sftool.SetContext(msg.Channel, msg.ChatID)
-				}
-			}
-			if ct := a.tools.Get("cron"); ct != nil {
-				if ctool, ok := ct.(interface{ SetContext(string, string) }); ok {
-					ctool.SetContext(msg.Channel, msg.ChatID)
-				}
-			}
-
-			// Build messages from session, long-term memory, and recent memory.
-			// System channels (heartbeat, cron) get a blank ephemeral session so
-			// their history never accumulates and bloats the context window.
-			var sess *session.Session
-			if isSystemChannel(msg.Channel) {
-				sess = &session.Session{Key: msg.Channel + ":" + msg.ChatID}
-			} else {
-				sess = a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
-			}
-			// get file-backed memory context (long-term + today)
-			memCtx, _ := a.memory.GetMemoryContext()
-			memories := a.memory.Recent(5)
-			messages := a.context.BuildMessages(sess.GetHistory(), msg.Content, msg.Channel, msg.ChatID, memCtx, memories)
-
-			iteration := 0
-			finalContent := ""
-			lastToolResult := ""
-			toolDefs := a.tools.Definitions()
-			for iteration < a.maxIterations {
-				iteration++
-				resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model)
-				if err != nil {
-					log.Printf("provider error: %v", err)
-					finalContent = "Sorry, I encountered an error while processing your request."
-					break
-				}
-
-				if resp.HasToolCalls {
-					// append assistant message with tool_calls attached
-					messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
-					// execute each tool call and return results with "tool" role
-					for _, tc := range resp.ToolCalls {
-						if a.enableToolActivity {
-							sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
-								formatToolActivity(tc.Name, tc.Arguments))
-						}
-
-						start := time.Now()
-						res, err := a.tools.Execute(ctx, tc.Name, tc.Arguments)
-						elapsed := time.Since(start).Round(time.Millisecond)
-
-						if err != nil {
-							if a.enableToolActivity {
-								sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
-									fmt.Sprintf("📢 %s failed (%s): %v", tc.Name, elapsed, err))
-							}
-							res = "(tool error) " + err.Error()
-						} else {
-							if a.enableToolActivity {
-								sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
-									fmt.Sprintf("📢 %s done (%s)", tc.Name, elapsed))
-							}
-						}
-						lastToolResult = res
-						messages = append(messages, providers.Message{Role: "tool", Content: res, ToolCallID: tc.ID})
-					}
-					// loop again
-					continue
-				} else {
-					finalContent = resp.Content
-					break
-				}
-			}
-
-			if finalContent == "" && lastToolResult != "" {
-				finalContent = lastToolResult
-			} else if finalContent == "" {
-				finalContent = "I've completed processing but have no response to give."
-			}
-
-			// Save session for interactive channels only.
-			// System channels (heartbeat, cron) are stateless triggers — their
-			// history must not be persisted, otherwise the file grows unboundedly.
-			if !isSystemChannel(msg.Channel) {
-				sess.AddMessage("user", msg.Content)
-				sess.AddMessage("assistant", finalContent)
-				if err := a.sessions.Save(sess); err != nil {
-					log.Printf("error saving session: %v", err)
-				}
-			}
-
-			out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: finalContent}
-			select {
-			case a.hub.Out <- out:
-			default:
-				log.Println("Outbound channel full, dropping message")
-			}
-		default:
-			// idle tick
-			time.Sleep(100 * time.Millisecond)
+			// Offload the message processing to a concurrent goroutine so that we don't
+			// block the inbound queue, allowing approval/cancel messages to be read.
+			go a.processMessage(ctx, msg)
 		}
+	}
+}
+
+func (a *AgentLoop) processMessage(ctx context.Context, msg chat.Inbound) {
+	// Quick heuristic: if user asks the agent to remember something explicitly,
+	// store it in today's note and reply immediately without calling the LLM.
+	trimmed := strings.TrimSpace(msg.Content)
+	rememberRe := rememberRE
+	if matches := rememberRe.FindStringSubmatch(trimmed); len(matches) == 2 {
+		note := matches[1]
+		if err := a.memory.AppendToday(note); err != nil {
+			log.Printf("error appending to memory: %v", err)
+		}
+		out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: "OK, I've remembered that."}
+		select {
+		case a.hub.Out <- out:
+		default:
+			log.Println("Outbound channel full, dropping message")
+		}
+		// Only save session for interactive channels, not system triggers.
+		if !isSystemChannel(msg.Channel) {
+			sess := a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
+			sess.AddMessage("user", msg.Content)
+			sess.AddMessage("assistant", "OK, I've remembered that.")
+			if err := a.sessions.Save(sess); err != nil {
+				log.Printf("error saving session: %v", err)
+			}
+		}
+		return
+	}
+
+	// Set tool context (so message tool knows channel+chat)
+	if mt := a.tools.Get("message"); mt != nil {
+		if mtool, ok := mt.(interface{ SetContext(string, string) }); ok {
+			mtool.SetContext(msg.Channel, msg.ChatID)
+		}
+	}
+	if sft := a.tools.Get("send_file"); sft != nil {
+		if sftool, ok := sft.(interface{ SetContext(string, string) }); ok {
+			sftool.SetContext(msg.Channel, msg.ChatID)
+		}
+	}
+	if et := a.tools.Get("exec"); et != nil {
+		if etool, ok := et.(interface{ SetContext(string, string) }); ok {
+			etool.SetContext(msg.Channel, msg.ChatID)
+		}
+	}
+	if ct := a.tools.Get("cron"); ct != nil {
+		if ctool, ok := ct.(interface{ SetContext(string, string) }); ok {
+			ctool.SetContext(msg.Channel, msg.ChatID)
+		}
+	}
+
+	// Build messages from session, long-term memory, and recent memory.
+	// System channels (heartbeat, cron) get a blank ephemeral session so
+	// their history never accumulates and bloats the context window.
+	var sess *session.Session
+	if isSystemChannel(msg.Channel) {
+		sess = &session.Session{Key: msg.Channel + ":" + msg.ChatID}
+	} else {
+		sess = a.sessions.GetOrCreate(msg.Channel + ":" + msg.ChatID)
+	}
+	// get file-backed memory context (long-term + today)
+	memCtx, _ := a.memory.GetMemoryContext()
+	memories := a.memory.Recent(5)
+	messages := a.context.BuildMessages(sess.GetHistory(), msg.Content, msg.Channel, msg.ChatID, memCtx, memories)
+
+	iteration := 0
+	finalContent := ""
+	lastToolResult := ""
+	toolDefs := a.tools.Definitions()
+	for iteration < a.maxIterations {
+		iteration++
+		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model)
+		if err != nil {
+			log.Printf("provider error: %v", err)
+			finalContent = "Sorry, I encountered an error while processing your request."
+			break
+		}
+
+		if resp.HasToolCalls {
+			// append assistant message with tool_calls attached
+			messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
+			// execute each tool call and return results with "tool" role
+			for _, tc := range resp.ToolCalls {
+				if a.enableToolActivity {
+					sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
+						formatToolActivity(tc.Name, tc.Arguments))
+				}
+
+				start := time.Now()
+				toolCtx := chat.WithContext(ctx, msg.Channel, msg.ChatID)
+				res, err := a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
+				elapsed := time.Since(start).Round(time.Millisecond)
+
+				if err != nil {
+					if a.enableToolActivity {
+						sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
+							fmt.Sprintf("📢 %s failed (%s): %v", tc.Name, elapsed, err))
+					}
+					res = "(tool error) " + err.Error()
+				} else {
+					if a.enableToolActivity {
+						sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
+							fmt.Sprintf("📢 %s done (%s)", tc.Name, elapsed))
+					}
+				}
+				lastToolResult = res
+				messages = append(messages, providers.Message{Role: "tool", Content: res, ToolCallID: tc.ID})
+			}
+			// loop again
+			continue
+		} else {
+			finalContent = resp.Content
+			break
+		}
+	}
+
+	if finalContent == "" && lastToolResult != "" {
+		finalContent = lastToolResult
+	} else if finalContent == "" {
+		finalContent = "I've completed processing but have no response to give."
+	}
+
+	// Save session for interactive channels only.
+	// System channels (heartbeat, cron) are stateless triggers — their
+	// history must not be persisted, otherwise the file grows unboundedly.
+	if !isSystemChannel(msg.Channel) {
+		sess.AddMessage("user", msg.Content)
+		sess.AddMessage("assistant", finalContent)
+		if err := a.sessions.Save(sess); err != nil {
+			log.Printf("error saving session: %v", err)
+		}
+	}
+
+	out := chat.Outbound{Channel: msg.Channel, ChatID: msg.ChatID, Content: finalContent}
+	select {
+	case a.hub.Out <- out:
+	default:
+		log.Println("Outbound channel full, dropping message")
 	}
 }
 
@@ -336,6 +351,11 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 	if sft := a.tools.Get("send_file"); sft != nil {
 		if sftool, ok := sft.(interface{ SetContext(string, string) }); ok {
 			sftool.SetContext("cli", "direct")
+		}
+	}
+	if et := a.tools.Get("exec"); et != nil {
+		if etool, ok := et.(interface{ SetContext(string, string) }); ok {
+			etool.SetContext("cli", "direct")
 		}
 	}
 	if ct := a.tools.Get("cron"); ct != nil {
@@ -371,7 +391,8 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 		// Execute tool calls
 		messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 		for _, tc := range resp.ToolCalls {
-			result, err := a.tools.Execute(ctx, tc.Name, tc.Arguments)
+			toolCtx := chat.WithContext(ctx, "cli", "direct")
+			result, err := a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
 			if err != nil {
 				result = "(tool error) " + err.Error()
 			}

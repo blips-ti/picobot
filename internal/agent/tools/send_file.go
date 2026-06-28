@@ -73,10 +73,18 @@ func (s *SendFileTool) Execute(ctx context.Context, args map[string]interface{})
 		return "", fmt.Errorf("send_file: file does not exist: %s", pathStr)
 	}
 
+	channel, chatID := chat.FromContext(ctx)
+	if channel == "" {
+		channel = s.channel
+	}
+	if chatID == "" {
+		chatID = s.chatID
+	}
+
 	// Publish outbound message to hub
 	out := chat.Outbound{
-		Channel: s.channel,
-		ChatID:  s.chatID,
+		Channel: channel,
+		ChatID:  chatID,
 		Content: caption,
 		Media:   []string{absPath},
 	}

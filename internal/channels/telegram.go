@@ -95,6 +95,19 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 						} `json:"chat"`
 						Text string `json:"text"`
 					} `json:"message"`
+					CallbackQuery *struct {
+						ID   string `json:"id"`
+						From struct {
+							ID int64 `json:"id"`
+						} `json:"from"`
+						Message *struct {
+							MessageID int64 `json:"message_id"`
+							Chat      struct {
+								ID int64 `json:"id"`
+							} `json:"chat"`
+						} `json:"message"`
+						Data string `json:"data"`
+					} `json:"callback_query"`
 				} `json:"result"`
 			}
 			if err := json.Unmarshal(body, &gu); err != nil {
@@ -105,6 +118,55 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 				if upd.UpdateID >= offset {
 					offset = upd.UpdateID + 1
 				}
+
+				if upd.CallbackQuery != nil {
+					cq := upd.CallbackQuery
+					fromID := strconv.FormatInt(cq.From.ID, 10)
+					if len(allowed) > 0 {
+						if _, ok := allowed[fromID]; !ok {
+							log.Printf("telegram: dropping callback query from unauthorized user %s", fromID)
+							continue
+						}
+					}
+					chatID := strconv.FormatInt(cq.Message.Chat.ID, 10)
+
+					// Answer callback query so the loading indicator finishes
+					go func(cqID string) {
+						uAnswer := base + "/answerCallbackQuery"
+						vAnswer := url.Values{}
+						vAnswer.Set("callback_query_id", cqID)
+						respAnswer, errAnswer := client.PostForm(uAnswer, vAnswer)
+						if errAnswer == nil {
+							io.ReadAll(respAnswer.Body)
+							respAnswer.Body.Close()
+						}
+					}(cq.ID)
+
+					// Edit message reply markup to remove inline keyboard
+					go func(cID string, mID int64) {
+						uEdit := base + "/editMessageReplyMarkup"
+						vEdit := url.Values{}
+						vEdit.Set("chat_id", cID)
+						vEdit.Set("message_id", strconv.FormatInt(mID, 10))
+						vEdit.Set("reply_markup", "{}")
+						respEdit, errEdit := client.PostForm(uEdit, vEdit)
+						if errEdit == nil {
+							io.ReadAll(respEdit.Body)
+							respEdit.Body.Close()
+						}
+					}(chatID, cq.Message.MessageID)
+
+					// Route button data as message input
+					hub.In <- chat.Inbound{
+						Channel:   "telegram",
+						SenderID:  fromID,
+						ChatID:    chatID,
+						Content:   cq.Data,
+						Timestamp: time.Now(),
+					}
+					continue
+				}
+
 				if upd.Message == nil {
 					continue
 				}
@@ -233,6 +295,11 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 					v.Set("chat_id", out.ChatID)
 					v.Set("text", markdownToHTML(out.Content))
 					v.Set("parse_mode", "HTML")
+					if out.Metadata != nil {
+						if markup, ok := out.Metadata["telegram_reply_markup"].(string); ok && markup != "" {
+							v.Set("reply_markup", markup)
+						}
+					}
 					resp, err := client.PostForm(u, v)
 					if err != nil {
 						log.Printf("telegram sendMessage error: %v", err)

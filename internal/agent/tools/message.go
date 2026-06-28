@@ -57,10 +57,18 @@ func (m *MessageTool) Execute(ctx context.Context, args map[string]interface{}) 
 	if content == "" {
 		return "", fmt.Errorf("message tool: 'content' argument required")
 	}
+	channel, chatID := chat.FromContext(ctx)
+	if channel == "" {
+		channel = m.channel
+	}
+	if chatID == "" {
+		chatID = m.chatID
+	}
+
 	// Publish outbound message to hub
 	out := chat.Outbound{
-		Channel: m.channel,
-		ChatID:  m.chatID,
+		Channel: channel,
+		ChatID:  chatID,
 		Content: content,
 	}
 	select {
