@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/local/picobot/internal/chat"
 )
@@ -13,6 +14,7 @@ import (
 type SendFileTool struct {
 	hub       *chat.Hub
 	workspace string
+	mu        sync.RWMutex
 	channel   string
 	chatID    string
 }
@@ -45,6 +47,8 @@ func (s *SendFileTool) Parameters() map[string]interface{} {
 }
 
 func (s *SendFileTool) SetContext(channel, chatID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.channel = channel
 	s.chatID = chatID
 }
@@ -75,10 +79,14 @@ func (s *SendFileTool) Execute(ctx context.Context, args map[string]interface{})
 
 	channel, chatID := chat.FromContext(ctx)
 	if channel == "" {
+		s.mu.RLock()
 		channel = s.channel
+		s.mu.RUnlock()
 	}
 	if chatID == "" {
+		s.mu.RLock()
 		chatID = s.chatID
+		s.mu.RUnlock()
 	}
 
 	// Publish outbound message to hub

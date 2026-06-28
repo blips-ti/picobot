@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -70,6 +71,7 @@ type AgentLoop struct {
 	running            bool
 	mcpClients         []*mcp.Client
 	enableToolActivity bool
+	workspace          string
 }
 
 // NewAgentLoop creates a new AgentLoop with the given provider.
@@ -90,7 +92,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 		log.Fatalf("failed to open workspace root %q: %v", workspace, err)
 	}
 
-	fsTool, err := tools.NewFilesystemTool(workspace)
+	fsTool, err := tools.NewFilesystemTool(b, workspace)
 	if err != nil {
 		log.Fatalf("failed to create filesystem tool: %v", err)
 	}
@@ -147,7 +149,7 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 		log.Printf("MCP server %q: registered %d tools", name, len(client.Tools()))
 	}
 
-	return &AgentLoop{hub: b, provider: provider, tools: reg, sessions: sm, context: ctx, memory: mem, model: model, maxIterations: maxIterations, mcpClients: mcpClients, enableToolActivity: true}
+	return &AgentLoop{hub: b, provider: provider, tools: reg, sessions: sm, context: ctx, memory: mem, model: model, maxIterations: maxIterations, mcpClients: mcpClients, enableToolActivity: true, workspace: workspace}
 }
 
 // SetToolActivityIndicator controls whether the feedback of tool progress
@@ -265,6 +267,7 @@ func (a *AgentLoop) processMessage(ctx context.Context, msg chat.Inbound) {
 	toolDefs := a.tools.Definitions()
 	for iteration < a.maxIterations {
 		iteration++
+		messages = pruneOlderToolMessages(messages)
 		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model)
 		if err != nil {
 			log.Printf("provider error: %v", err)
@@ -284,7 +287,15 @@ func (a *AgentLoop) processMessage(ctx context.Context, msg chat.Inbound) {
 
 				start := time.Now()
 				toolCtx := chat.WithContext(ctx, msg.Channel, msg.ChatID)
-				res, err := a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
+
+				var res string
+				var err error
+				if guardErr := a.checkPlanGuard(tc.Name, tc.Arguments); guardErr != nil {
+					res = "(tool error) " + guardErr.Error()
+					err = guardErr
+				} else {
+					res, err = a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
+				}
 				elapsed := time.Since(start).Round(time.Millisecond)
 
 				if err != nil {
@@ -292,7 +303,9 @@ func (a *AgentLoop) processMessage(ctx context.Context, msg chat.Inbound) {
 						sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
 							fmt.Sprintf("📢 %s failed (%s): %v", tc.Name, elapsed, err))
 					}
-					res = "(tool error) " + err.Error()
+					if res == "" {
+						res = "(tool error) " + err.Error()
+					}
 				} else {
 					if a.enableToolActivity {
 						sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
@@ -372,6 +385,7 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 	// Support tool calling iterations (similar to main loop)
 	var lastToolResult string
 	for iteration := 0; iteration < a.maxIterations; iteration++ {
+		messages = pruneOlderToolMessages(messages)
 		resp, err := a.provider.Chat(ctx, messages, a.tools.Definitions(), a.model)
 		if err != nil {
 			return "", err
@@ -391,10 +405,16 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 		// Execute tool calls
 		messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 		for _, tc := range resp.ToolCalls {
-			toolCtx := chat.WithContext(ctx, "cli", "direct")
-			result, err := a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
-			if err != nil {
-				result = "(tool error) " + err.Error()
+			var result string
+			var err error
+			if guardErr := a.checkPlanGuard(tc.Name, tc.Arguments); guardErr != nil {
+				result = "(tool error) " + guardErr.Error()
+			} else {
+				toolCtx := chat.WithContext(ctx, "cli", "direct")
+				result, err = a.tools.Execute(toolCtx, tc.Name, tc.Arguments)
+				if err != nil {
+					result = "(tool error) " + err.Error()
+				}
 			}
 			lastToolResult = result
 			messages = append(messages, providers.Message{Role: "tool", Content: result, ToolCallID: tc.ID})
@@ -446,4 +466,60 @@ func formatToolActivity(name string, args map[string]interface{}) string {
 	}
 	return fmt.Sprintf("🤖 Running: %s %s", name, argStr)
 }
+
+// pruneOlderToolMessages identifies tool result messages that were generated
+// in previous turns of the active execution loop, and truncates their content
+// if it exceeds 1024 characters. This prevents context bloat during long runs.
+func pruneOlderToolMessages(msgs []providers.Message) []providers.Message {
+	lastAssistantIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			lastAssistantIdx = i
+			break
+		}
+	}
+
+	result := make([]providers.Message, len(msgs))
+	for i, m := range msgs {
+		if m.Role == "tool" && i < lastAssistantIdx {
+			if len(m.Content) > 1024 {
+				m.Content = fmt.Sprintf("[Tool result truncated to save context. Original size: %d bytes. Content is saved/available locally if needed.]", len(m.Content))
+			}
+		}
+		result[i] = m
+	}
+	return result
+}
+
+// checkPlanGuard checks if PLAN.md exists in the workspace before allowing modifying/active tool calls.
+func (a *AgentLoop) checkPlanGuard(name string, args map[string]interface{}) error {
+	planPath := filepath.Join(a.workspace, "PLAN.md")
+	if _, err := os.Stat(planPath); err == nil {
+		return nil
+	}
+
+	// PLAN.md does not exist. Allow only read/list filesystem actions, memory, list/read skill, and message tools.
+	if name == "filesystem" {
+		action, _ := args["action"].(string)
+		path, _ := args["path"].(string)
+		if action == "read" || action == "list" {
+			return nil
+		}
+		if action == "write" && strings.Contains(strings.ToLower(path), "plan.md") {
+			return nil
+		}
+		return fmt.Errorf("you must first create a 'PLAN.md' file in the workspace detailing your objective, steps, and status (using the filesystem write tool) before modifying other files")
+	}
+
+	if name == "message" || name == "read_memory" || name == "write_memory" || name == "edit_memory" || name == "list_memory" || name == "delete_memory" {
+		return nil
+	}
+	if name == "list_skills" || name == "read_skill" {
+		return nil
+	}
+
+	return fmt.Errorf("you must first create a 'PLAN.md' file in the workspace detailing your objective, steps, and status (using the filesystem write tool) before calling the '%s' tool", name)
+}
+
+
 

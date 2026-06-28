@@ -3,9 +3,11 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/local/picobot/internal/chat"
@@ -23,6 +25,7 @@ type ExecTool struct {
 	hub        *chat.Hub
 	timeout    time.Duration
 	allowedDir string
+	mu         sync.RWMutex
 	channel    string
 	chatID     string
 }
@@ -45,6 +48,8 @@ func (t *ExecTool) Description() string {
 }
 
 func (t *ExecTool) SetContext(channel, chatID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.channel = channel
 	t.chatID = chatID
 }
@@ -112,7 +117,7 @@ func formatCmd(prog string, argv []string, shellCmd string, isShell bool) string
 	}
 	var sb strings.Builder
 	sb.WriteString(prog)
-	for _, a := range argv {
+	for _, a := range argv[1:] {
 		sb.WriteString(" ")
 		if strings.Contains(a, " ") || strings.Contains(a, "\n") {
 			sb.WriteString(fmt.Sprintf("%q", a))
@@ -131,11 +136,16 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) (st
 	}
 
 	channel, chatID := chat.FromContext(ctx)
+	log.Printf("ExecTool.Execute: fromContext channel=%q chatID=%q", channel, chatID)
 	if channel == "" {
+		t.mu.RLock()
 		channel = t.channel
+		t.mu.RUnlock()
 	}
 	if chatID == "" {
+		t.mu.RLock()
 		chatID = t.chatID
+		t.mu.RUnlock()
 	}
 	requireApproval := channel != "cli" && channel != "" && chatID != "" && t.hub != nil && channel != "heartbeat" && channel != "cron"
 
