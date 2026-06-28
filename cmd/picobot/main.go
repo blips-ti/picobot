@@ -161,7 +161,10 @@ func NewRootCmd() *cobra.Command {
 		Short: "Start long-running gateway (agent, channels, heartbeat)",
 		Run: func(cmd *cobra.Command, args []string) {
 			hub := chat.NewHub(200)
-			cfg, _ := config.LoadConfig()
+			cfg, err := config.LoadConfig()
+			if err != nil {
+				log.Fatalf("failed to load config: %v", err)
+			}
 			provider := providers.NewProviderFromConfig(cfg)
 
 			// choose model: flag > config > provider default
