@@ -257,8 +257,9 @@ func NewRootCmd() *cobra.Command {
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			<-sigCh
-			fmt.Println("shutting down gateway")
+			fmt.Println("\nshutting down gateway...")
 			cancel()
+			time.Sleep(500 * time.Millisecond)
 		},
 	}
 	gatewayCmd.Flags().StringP("model", "M", "", "Model to use (overrides model in config.json)")

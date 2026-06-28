@@ -9,10 +9,23 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/local/picobot/internal/chat"
 )
+
+var (
+	draftCounter int64
+	statesMu     sync.Mutex
+	states       = make(map[string]*chatState)
+)
+
+type chatState struct {
+	draftID         int64
+	accumulatedText string
+}
 
 // StartTelegram is a convenience wrapper that uses the real polling implementation
 // with the standard Telegram base URL.
@@ -104,6 +117,30 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 					}
 				}
 				chatID := strconv.FormatInt(m.Chat.ID, 10)
+
+				// Start a new turn: increment draft counter and assign it
+				newDraftID := atomic.AddInt64(&draftCounter, 1)
+				statesMu.Lock()
+				states[chatID] = &chatState{
+					draftID:         newDraftID,
+					accumulatedText: "",
+				}
+				statesMu.Unlock()
+
+				// Send an initial draft to indicate thinking / typing state
+				go func(cID string, dID int64) {
+					uDraft := base + "/sendMessageDraft"
+					vDraft := url.Values{}
+					vDraft.Set("chat_id", cID)
+					vDraft.Set("draft_id", strconv.FormatInt(dID, 10))
+					vDraft.Set("text", "") // empty text shows "Thinking..." placeholder
+					respDraft, errDraft := client.PostForm(uDraft, vDraft)
+					if errDraft == nil {
+						io.ReadAll(respDraft.Body)
+						respDraft.Body.Close()
+					}
+				}(chatID, newDraftID)
+
 				hub.In <- chat.Inbound{
 					Channel:   "telegram",
 					SenderID:  fromID,
@@ -128,17 +165,94 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 				log.Println("telegram: stopping outbound sender")
 				return
 			case out := <-outCh:
-				u := base + "/sendMessage"
-				v := url.Values{}
-				v.Set("chat_id", out.ChatID)
-				v.Set("text", out.Content)
-				resp, err := client.PostForm(u, v)
-				if err != nil {
-					log.Printf("telegram sendMessage error: %v", err)
-					continue
+				statesMu.Lock()
+				state, ok := states[out.ChatID]
+				if !ok {
+					// Fallback if no draft is initialized
+					newDraftID := atomic.AddInt64(&draftCounter, 1)
+					state = &chatState{
+						draftID:         newDraftID,
+						accumulatedText: "",
+					}
+					states[out.ChatID] = state
 				}
-				io.ReadAll(resp.Body)
-				resp.Body.Close()
+				statesMu.Unlock()
+
+				isNotif := false
+				if out.Metadata != nil {
+					if v, ok := out.Metadata["is_notification"].(bool); ok && v {
+						isNotif = true
+					}
+				}
+
+				if isNotif {
+					// Accumulate intermediate notification status messages
+					if state.accumulatedText != "" {
+						state.accumulatedText += "\n" + out.Content
+					} else {
+						state.accumulatedText = out.Content
+					}
+
+					u := base + "/sendMessageDraft"
+					v := url.Values{}
+					v.Set("chat_id", out.ChatID)
+					v.Set("draft_id", strconv.FormatInt(state.draftID, 10))
+					v.Set("text", markdownToHTML(state.accumulatedText))
+					v.Set("parse_mode", "HTML")
+					resp, err := client.PostForm(u, v)
+					if err != nil {
+						log.Printf("telegram sendMessageDraft error: %v", err)
+						continue
+					}
+					body, readErr := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if readErr == nil {
+						var res struct {
+							Ok          bool   `json:"ok"`
+							Description string `json:"description"`
+						}
+						if json.Unmarshal(body, &res) == nil && !res.Ok {
+							log.Printf("telegram sendMessageDraft HTML parse failed: %s. Falling back to plain text.", res.Description)
+							v.Del("parse_mode")
+							v.Set("text", state.accumulatedText)
+							resp2, err2 := client.PostForm(u, v)
+							if err2 == nil {
+								io.ReadAll(resp2.Body)
+								resp2.Body.Close()
+							}
+						}
+					}
+				} else {
+					// Final message: send via standard sendMessage to finalize and replace the draft
+					u := base + "/sendMessage"
+					v := url.Values{}
+					v.Set("chat_id", out.ChatID)
+					v.Set("text", markdownToHTML(out.Content))
+					v.Set("parse_mode", "HTML")
+					resp, err := client.PostForm(u, v)
+					if err != nil {
+						log.Printf("telegram sendMessage error: %v", err)
+						continue
+					}
+					body, readErr := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if readErr == nil {
+						var res struct {
+							Ok          bool   `json:"ok"`
+							Description string `json:"description"`
+						}
+						if json.Unmarshal(body, &res) == nil && !res.Ok {
+							log.Printf("telegram sendMessage HTML parse failed: %s. Falling back to plain text.", res.Description)
+							v.Del("parse_mode")
+							v.Set("text", out.Content)
+							resp2, err2 := client.PostForm(u, v)
+							if err2 == nil {
+								io.ReadAll(resp2.Body)
+								resp2.Body.Close()
+							}
+						}
+					}
+				}
 			}
 		}
 	}()

@@ -14,8 +14,9 @@ import (
 
 func TestStartTelegramWithBase(t *testing.T) {
 	token := "testtoken"
-	// channel to capture sendMessage posts
+	// channels to capture sendMessage and sendMessageDraft posts
 	sent := make(chan url.Values, 4)
+	drafts := make(chan url.Values, 4)
 
 	// simple stateful handler: first getUpdates returns one update, subsequent return empty
 	first := true
@@ -29,6 +30,16 @@ func TestStartTelegramWithBase(t *testing.T) {
 				return
 			}
 			w.Write([]byte(`{"ok":true,"result":[]}`))
+			return
+		}
+		if strings.HasSuffix(path, "/sendMessageDraft") {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			drafts <- r.PostForm
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true,"result":{}}`))
 			return
 		}
 		if strings.HasSuffix(path, "/sendMessage") {
@@ -57,6 +68,16 @@ func TestStartTelegramWithBase(t *testing.T) {
 	// to each channel's subscription (telegram in this test).
 	b.StartRouter(ctx)
 
+	// Wait for the initial "Thinking..." draft from the inbound handler
+	select {
+	case v := <-drafts:
+		if v.Get("chat_id") != "456" || v.Get("text") != "" {
+			t.Fatalf("unexpected initial draft form: %v", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for initial draft message")
+	}
+
 	// Wait for inbound from getUpdates
 	select {
 	case msg := <-b.In:
@@ -70,7 +91,25 @@ func TestStartTelegramWithBase(t *testing.T) {
 		t.Fatal("timeout waiting for inbound message")
 	}
 
-	// send an outbound message and ensure server receives it
+	// Send an outbound notification message
+	notif := chat.Outbound{
+		Channel:  "telegram",
+		ChatID:   "456",
+		Content:  "thinking 1",
+		Metadata: map[string]interface{}{"is_notification": true},
+	}
+	b.Out <- notif
+
+	select {
+	case v := <-drafts:
+		if v.Get("chat_id") != "456" || v.Get("text") != "thinking 1" {
+			t.Fatalf("unexpected draft notification form: %v", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for draft notification message")
+	}
+
+	// send an outbound final message and ensure server receives it
 	out := chat.Outbound{Channel: "telegram", ChatID: "456", Content: "reply"}
 	b.Out <- out
 

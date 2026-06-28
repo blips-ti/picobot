@@ -29,7 +29,12 @@ func sendChannelNotification(hub *chat.Hub, channel, chatID, content string) {
 	if isSystemChannel(channel) {
 		return
 	}
-	out := chat.Outbound{Channel: channel, ChatID: chatID, Content: content}
+	out := chat.Outbound{
+		Channel:  channel,
+		ChatID:   chatID,
+		Content:  content,
+		Metadata: map[string]interface{}{"is_notification": true},
+	}
 	select {
 	case hub.Out <- out:
 	default:
@@ -247,10 +252,9 @@ func (a *AgentLoop) Run(ctx context.Context) {
 					messages = append(messages, providers.Message{Role: "assistant", Content: resp.Content, ToolCalls: resp.ToolCalls})
 					// execute each tool call and return results with "tool" role
 					for _, tc := range resp.ToolCalls {
-						argsJSON, _ := json.Marshal(tc.Arguments)
 						if a.enableToolActivity {
 							sendChannelNotification(a.hub, msg.Channel, msg.ChatID,
-								fmt.Sprintf("🤖 Running: %s %s", tc.Name, argsJSON))
+								formatToolActivity(tc.Name, tc.Arguments))
 						}
 
 						start := time.Now()
@@ -367,3 +371,47 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 
 	return "Max iterations reached without final response", nil
 }
+
+// formatToolActivity provides a clean, user-friendly summary of tool execution arguments
+// instead of posting large raw JSON payloads (e.g. whole files or long commands).
+func formatToolActivity(name string, args map[string]interface{}) string {
+	if name == "filesystem" {
+		action, _ := args["action"].(string)
+		path, _ := args["path"].(string)
+		if action != "" && path != "" {
+			return fmt.Sprintf("🤖 Running: filesystem %s (%s)", action, path)
+		}
+	} else if name == "exec" {
+		cmd, _ := args["command"].(string)
+		if len(cmd) > 60 {
+			cmd = cmd[:57] + "..."
+		}
+		if cmd != "" {
+			return fmt.Sprintf("🤖 Running: exec `%s`", cmd)
+		}
+	} else if name == "web" {
+		u, _ := args["url"].(string)
+		if u != "" {
+			return fmt.Sprintf("🤖 Running: web fetch (%s)", u)
+		}
+	} else if name == "web_search" {
+		q, _ := args["query"].(string)
+		if q != "" {
+			return fmt.Sprintf("🤖 Running: search `%s`", q)
+		}
+	} else if name == "write_memory" || name == "read_memory" || name == "edit_memory" {
+		target, _ := args["target"].(string)
+		if target != "" {
+			return fmt.Sprintf("🤖 Running: memory %s (%s)", name, target)
+		}
+	}
+
+	// Fallback to a truncated JSON representation
+	b, _ := json.Marshal(args)
+	argStr := string(b)
+	if len(argStr) > 80 {
+		argStr = argStr[:77] + "..."
+	}
+	return fmt.Sprintf("🤖 Running: %s %s", name, argStr)
+}
+
