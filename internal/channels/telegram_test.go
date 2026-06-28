@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ func TestStartTelegramWithBase(t *testing.T) {
 	// channels to capture sendMessage and sendMessageDraft posts
 	sent := make(chan url.Values, 4)
 	drafts := make(chan url.Values, 4)
+	docsSent := make(chan string, 4)
 
 	// simple stateful handler: first getUpdates returns one update, subsequent return empty
 	first := true
@@ -48,6 +50,16 @@ func TestStartTelegramWithBase(t *testing.T) {
 				return
 			}
 			sent <- r.PostForm
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ok":true,"result":{}}`))
+			return
+		}
+		if strings.HasSuffix(path, "/sendDocument") {
+			if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			docsSent <- r.FormValue("chat_id")
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"ok":true,"result":{}}`))
 			return
@@ -120,6 +132,45 @@ func TestStartTelegramWithBase(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for sendMessage to be posted")
+	}
+
+	// Test sending a file
+	tmpFile, err := os.CreateTemp("", "picobot-test-media-*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.Write([]byte("test file content")); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	outWithFile := chat.Outbound{
+		Channel: "telegram",
+		ChatID:  "456",
+		Content: "here is a file",
+		Media:   []string{tmpFile.Name()},
+	}
+	b.Out <- outWithFile
+
+	// Expect the message text first
+	select {
+	case v := <-sent:
+		if v.Get("chat_id") != "456" || v.Get("text") != "here is a file" {
+			t.Fatalf("unexpected sendMessage form: %v", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for sendMessage text")
+	}
+
+	// Expect the document next
+	select {
+	case chatID := <-docsSent:
+		if chatID != "456" {
+			t.Fatalf("unexpected sendDocument chatID: %s", chatID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for sendDocument")
 	}
 
 	// cancel and allow goroutines to stop

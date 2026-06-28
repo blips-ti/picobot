@@ -70,11 +70,25 @@ func isDangerousProg(prog string) bool {
 	return ok
 }
 
-func hasUnsafeArg(s string) bool {
-	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "~") || strings.Contains(s, "..") {
-		return true
+func (t *ExecTool) isSafeArg(s string) bool {
+	if strings.Contains(s, "..") {
+		return false
 	}
-	return false
+	if strings.HasPrefix(s, "~") {
+		return false
+	}
+	if strings.HasPrefix(s, "/") {
+		if t.allowedDir != "" {
+			cleanAllowed := filepath.Clean(t.allowedDir)
+			cleanArg := filepath.Clean(s)
+			rel, err := filepath.Rel(cleanAllowed, cleanArg)
+			if err == nil && !strings.HasPrefix(rel, "..") {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) (string, error) {
@@ -110,7 +124,7 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]interface{}) (st
 		return "", fmt.Errorf("exec: program '%s' is disallowed", prog)
 	}
 	for _, a := range argv[1:] {
-		if hasUnsafeArg(a) {
+		if !t.isSafeArg(a) {
 			return "", fmt.Errorf("exec: argument '%s' looks unsafe", a)
 		}
 	}

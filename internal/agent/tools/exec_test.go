@@ -65,3 +65,19 @@ func TestExecTimeout(t *testing.T) {
 		t.Fatalf("expected timeout error")
 	}
 }
+
+func TestExecAllowsSafeAbsoluteArg(t *testing.T) {
+	d := t.TempDir()
+	f := filepath.Join(d, "file.txt")
+	if err := os.WriteFile(f, []byte("content"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	e := NewExecToolWithWorkspace(2, d)
+	out, err := e.Execute(context.Background(), map[string]interface{}{"cmd": []interface{}{"cat", f}})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if out != "content" {
+		t.Fatalf("unexpected out: %s", out)
+	}
+}

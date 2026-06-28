@@ -95,8 +95,9 @@ func NewAgentLoop(b *chat.Hub, provider providers.LLMProvider, model string, max
 		log.Fatalf("failed to create filesystem tool: %v", err)
 	}
 	reg.Register(fsTool)
+	reg.Register(tools.NewSendFileTool(b, workspace))
 
-	reg.Register(tools.NewExecTool(60))
+	reg.Register(tools.NewExecToolWithWorkspace(60, workspace))
 	reg.Register(tools.NewWebTool())
 	reg.Register(tools.NewWebSearchTool())
 	reg.Register(tools.NewSpawnTool())
@@ -214,6 +215,11 @@ func (a *AgentLoop) Run(ctx context.Context) {
 					mtool.SetContext(msg.Channel, msg.ChatID)
 				}
 			}
+			if sft := a.tools.Get("send_file"); sft != nil {
+				if sftool, ok := sft.(interface{ SetContext(string, string) }); ok {
+					sftool.SetContext(msg.Channel, msg.ChatID)
+				}
+			}
 			if ct := a.tools.Get("cron"); ct != nil {
 				if ctool, ok := ct.(interface{ SetContext(string, string) }); ok {
 					ctool.SetContext(msg.Channel, msg.ChatID)
@@ -325,6 +331,11 @@ func (a *AgentLoop) ProcessDirect(content string, timeout time.Duration) (string
 	if mt := a.tools.Get("message"); mt != nil {
 		if mtool, ok := mt.(interface{ SetContext(string, string) }); ok {
 			mtool.SetContext("cli", "direct")
+		}
+	}
+	if sft := a.tools.Get("send_file"); sft != nil {
+		if sftool, ok := sft.(interface{ SetContext(string, string) }); ok {
+			sftool.SetContext("cli", "direct")
 		}
 	}
 	if ct := a.tools.Get("cron"); ct != nil {

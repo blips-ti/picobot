@@ -1,13 +1,17 @@
 package channels
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -232,24 +236,31 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 					resp, err := client.PostForm(u, v)
 					if err != nil {
 						log.Printf("telegram sendMessage error: %v", err)
-						continue
-					}
-					body, readErr := io.ReadAll(resp.Body)
-					resp.Body.Close()
-					if readErr == nil {
-						var res struct {
-							Ok          bool   `json:"ok"`
-							Description string `json:"description"`
-						}
-						if json.Unmarshal(body, &res) == nil && !res.Ok {
-							log.Printf("telegram sendMessage HTML parse failed: %s. Falling back to plain text.", res.Description)
-							v.Del("parse_mode")
-							v.Set("text", out.Content)
-							resp2, err2 := client.PostForm(u, v)
-							if err2 == nil {
-								io.ReadAll(resp2.Body)
-								resp2.Body.Close()
+					} else {
+						body, readErr := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						if readErr == nil {
+							var res struct {
+								Ok          bool   `json:"ok"`
+								Description string `json:"description"`
 							}
+							if json.Unmarshal(body, &res) == nil && !res.Ok {
+								log.Printf("telegram sendMessage HTML parse failed: %s. Falling back to plain text.", res.Description)
+								v.Del("parse_mode")
+								v.Set("text", out.Content)
+								resp2, err2 := client.PostForm(u, v)
+								if err2 == nil {
+									io.ReadAll(resp2.Body)
+									resp2.Body.Close()
+								}
+							}
+						}
+					}
+
+					// Send any attached media files
+					for _, filePath := range out.Media {
+						if err := sendTelegramDocument(client, base, out.ChatID, filePath, ""); err != nil {
+							log.Printf("telegram sendDocument error for %s: %v", filePath, err)
 						}
 					}
 				}
@@ -259,3 +270,64 @@ func StartTelegramWithBase(ctx context.Context, hub *chat.Hub, token, base strin
 
 	return nil
 }
+
+func sendTelegramDocument(client *http.Client, base, chatID, filePath, caption string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open file: %w", err)
+	}
+	defer file.Close()
+
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	if err := w.WriteField("chat_id", chatID); err != nil {
+		return err
+	}
+	if caption != "" {
+		if err := w.WriteField("caption", markdownToHTML(caption)); err != nil {
+			return err
+		}
+		if err := w.WriteField("parse_mode", "HTML"); err != nil {
+			return err
+		}
+	}
+
+	part, err := w.CreateFormFile("document", filepath.Base(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", base+"/sendDocument", &b)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	var res struct {
+		Ok          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(body, &res); err == nil && !res.Ok {
+		return fmt.Errorf("telegram API error: %s", res.Description)
+	}
+	return nil
+}
+
