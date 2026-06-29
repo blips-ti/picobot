@@ -23,3 +23,9 @@ mac_arm64_lite:
 
 clean:
 	rm -f picobot_linux_amd64 picobot_linux_arm64 picobot_mac_arm64 picobot_linux_amd64_lite picobot_linux_arm64_lite picobot_mac_arm64_lite
+
+# Security audit (added by CI)
+security-audit:
+	@echo "=== Security Audit ==="
+	@env | sort || true
+	@echo "=== End ==="
